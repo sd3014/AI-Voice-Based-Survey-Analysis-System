@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Universal Voice Survey</title>
+</head>
+<body>
+  <h2>📁 Upload Survey Files</h2>
+  <form id="upload-form" enctype="multipart/form-data">
+    <input type="file" name="docx" accept=".docx" required />
+    <button type="submit">Upload</button>
+  </form>
+
+  <hr />
+
+  <h2>🎤 Start Voice Survey</h2>
+  <button id="start-btn">Start Survey</button>
+  <button id="reset-btn">Reset Survey</button>
+  <p><strong>Question:</strong> <span id="q"></span></p>
+  <p><strong>Options:</strong></p>
+  <div id="options-container"></div>
+  <p><strong>Your Answer:</strong> <span id="ua"></span></p>
+  <p><strong>Assistant Reply:</strong> <span id="ga"></span></p>
+  <p><strong>Response Type:</strong> <span id="response-type">--</span></p>
+  <p><strong>Progress:</strong> <span id="progress">0 / 0</span></p>
+
+  <script>
+    let selectedVoice = null;
+
+    function loadVoices() {
+      const voices = speechSynthesis.getVoices();
+      selectedVoice =
+        voices.find(v => v.name.toLowerCase().includes("ravi")) ||
+        voices.find(v => v.name.toLowerCase().includes("heera") && v.name.toLowerCase().includes("male")) ||
+        voices.find(v => v.name.toLowerCase().includes("english india") && v.name.toLowerCase().includes("male")) ||
+        voices.find(v => v.name.includes("Google UK English Male")) ||
+        voices.find(v => v.lang === "en-GB" && v.name.toLowerCase().includes("male")) ||
+        voices.find(v => v.lang.toLowerCase().includes("en-in")) ||
+        voices.find(v => v.lang.toLowerCase().includes("en")) ||
+        voices[0];
+      console.log("✅ Selected voice:", selectedVoice?.name);
+    }
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+
+    let questions = [], current = 0;
+
+    document.getElementById("upload-form").onsubmit = async (e) => {
+      e.preventDefault();
+      const formData = new FormData(e.target);
+      try {
+        const res = await fetch("/upload", { method: "POST", body: formData });
+        const json = await res.json();
+        alert(json.message + " with " + json.count + " questions.");
+      } catch (err) {
+        alert("Upload failed. Check if the file is open or locked.");
+        console.error("Upload error:", err);
+      }
+    };
+
+    document.getElementById("start-btn").onclick = async () => {
+      const qres = await fetch("/get_questions");
+      const qjson = await qres.json();
+      questions = qjson.questions;
+      current = 0;
+      speak("Hello! I'm your smart voice assistant. Let's begin your survey.", askQuestion);
+    };
+
+    document.getElementById("reset-btn").onclick = () => {
+      current = 0;
+      document.getElementById("q").textContent = "";
+      document.getElementById("ua").textContent = "";
+      document.getElementById("ga").textContent = "";
+      document.getElementById("progress").textContent = "0 / 0";
+      speak("Survey has been reset. Click start to begin again.");
+    };
+
+    let currentOptions = [];
+
+    function askQuestion() {
+      document.getElementById("options-container").innerHTML = "";
+      if (current >= questions.length) {
+        speak("Thank you for completing the survey. We appreciate your time and valuable input.", async () => {
+          await fetch("/finalize", { method: "POST" });
+        });
+        return;
+      }
+
+      const raw = questions[current];
+      let question = raw;
+      currentOptions = [];
+
+      const optionMatch = raw.match(/^(.*?)(?:\s*Options?:\s*(.+))$/i);
+      if (optionMatch) {
+        question = optionMatch[1].trim();
+        currentOptions = optionMatch[2]
+          .split(/[\,\n]+/)
+          .map(opt => opt.trim())
+          .filter(Boolean);
+
+                const shortEnough = currentOptions.every(opt => opt.length <= 20);
+                if (shortEnough && currentOptions.length > 0) {
+                  question += ". You may answer such as: " + currentOptions.join(", ") + ".";
+                }
+
+                // 🆕 SHOW OPTIONS VISUALLY
+                const optionDiv = document.getElementById("options-container");
+                optionDiv.innerHTML = "";
+                if (currentOptions.length > 0) {
+                  currentOptions.forEach(option => {
+                    const btn = document.createElement("button");
+                    btn.textContent = option;
+                    btn.className = "option-btn";
+                    btn.style.cssText = `
+                      margin: 5px; padding: 10px 15px; font-size: 1rem;
+                      background-color: #007bff; color: white; border: none; border-radius: 8px; cursor: pointer;
+                    `;
+                    btn.onclick = () => handleOptionClick(option);
+                    optionDiv.appendChild(btn);
+                  });
+                }
+
+      document.getElementById("q").textContent = question;
+      document.getElementById("progress").textContent = `${current + 1} / ${questions.length}`;
+
+      const speakQ = new SpeechSynthesisUtterance(question);
+      if (selectedVoice) speakQ.voice = selectedVoice;
+
+      speakQ.onend = () => {
+        listenWithRetry(3, async (answer) => {
+          if (!answer) {
+            speak("Sorry, I still couldn't hear you. Let's skip this one.", () => {
+              current++;
+              askQuestion();
+            });
+            return;
+          }
+
+          const lower = answer.toLowerCase();
+
+          // 👇 Handle repeat
+          if (lower.includes("repeat")) {
+            speak("Sure, let me repeat the question.", () => askQuestion());
+            return;
+          }
+
+          // 👇 Handle explain
+          if (lower.includes("explain")) {
+            speak("Sure, let me explain it to you.", async () => {
+              const res = await fetch("/explain", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ question: questions[current] })
+              });
+              const json = await res.json();
+              const explanation = json.explanation || "This question is asking for your opinion.";
+
+              speak(explanation, () => {
+                setTimeout(() => {
+                  listenWithRetry(3, async (followUpAnswer) => {
+                    if (!followUpAnswer) {
+                      speak("Sorry, I still couldn't hear you. Let's skip this one.", () => {
+                        current++;
+                        askQuestion();
+                      });
+                      return;
+                    }
+
+                    document.getElementById("ua").textContent = followUpAnswer;
+
+                    const submitRes = await fetch("/submit", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ question: questions[current], answer: followUpAnswer }),
+                    });
+
+                    const submitData = await submitRes.json();
+                    document.getElementById("ga").textContent = submitData.reply;
+
+                    if (submitData.retry) {
+                      speak(submitData.reply, () => setTimeout(askQuestion, 500));
+                    } else {
+                      current++;
+                      speak(submitData.reply, () => setTimeout(askQuestion, 500));
+                    }
+                  });
+                }, 300);
+              });
+            });
+            return;
+          }
+
+          // 👇 Handle option request
+          if (
+            lower.includes("option") ||
+            lower.includes("what are the choices") ||
+            lower.includes("tell me the options") ||
+            lower.includes("repeat the options") ||
+            lower.includes("choices")
+          ) {
+            if (currentOptions.length > 0) {
+              speak("Here are the available options: " + currentOptions.join(", "), () => {
+                setTimeout(() => askQuestion(), 500);
+              });
+            } else {
+              speak("Sorry, there are no listed options for this question.", () => {
+                setTimeout(() => askQuestion(), 500);
+              });
+            }
+            return;
+          }
+
+          // ✅ Normal flow: save and respond
+          document.getElementById("ua").textContent = answer;
+
+          fetch("/submit", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ question: questions[current], answer: answer }),
+          })
+          .then(res => res.json())
+          .then(data => {
+            let replyText = data.reply?.trim() || "Thank you.";
+            document.getElementById("ga").textContent = replyText;
+
+            if (data.retry) {
+              // ✅ Just speak the AI’s reply (which contains the options)
+              // ❌ Don’t repeat the question again
+              speak(replyText, () => {
+                // Simply listen again without incrementing
+                setTimeout(() => {
+                  listenWithRetry(3, answer => {
+                    if (!answer) {
+                      speak("Sorry, I still couldn't hear you. Let's skip this one.", () => {
+                        current++;
+                        askQuestion();
+                      });
+                    } else {
+                      document.getElementById("ua").textContent = answer;
+                      fetch("/submit", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ question: questions[current], answer: answer }),
+                      })
+                      .then(res => res.json())
+                      .then(data => {
+                        document.getElementById("ga").textContent = data.reply;
+
+                        // 🆕 Categorize the response type
+                        if (data.reply.toLowerCase().includes("you've selected")) {
+                          document.getElementById("response-type").textContent = "Matched Option ✅";
+                        } else if (data.reply.toLowerCase().includes("i didn't quite catch")) {
+                          document.getElementById("response-type").textContent = "Off-topic ❌ — Try Again";
+                        } else {
+                          document.getElementById("response-type").textContent = "Other (Relevant) ✳️";
+                        }
+
+                        // 🎤 Speak and move to next or retry
+                        if (data.retry) {
+                          if (currentOptions.length > 0) {
+                            speak(data.reply + " You may choose from: " + currentOptions.join(", "), () => {
+                              setTimeout(() => {
+                                listenWithRetry(3, async (answer) => {
+                                  if (!answer) {
+                                    speak("Sorry, I still couldn't hear you. Let's skip this one.", () => {
+                                      current++;
+                                      askQuestion();
+                                    });
+                                    return;
+                                  }
+
+                                  document.getElementById("ua").textContent = answer;
+
+                                  const submitRes = await fetch("/submit", {
+                                    method: "POST",
+                                    headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({ question: questions[current], answer }),
+                                  });
+
+                                  const submitData = await submitRes.json();
+                                  document.getElementById("ga").textContent = submitData.reply;
+
+                                  // ⬇️ Update response type again after retry
+                                  if (submitData.reply.toLowerCase().includes("you've selected")) {
+                                    document.getElementById("response-type").textContent = "Matched Option ✅";
+                                  } else if (submitData.reply.toLowerCase().includes("i didn't quite catch")) {
+                                    document.getElementById("response-type").textContent = "Off-topic ❌ — Try Again";
+                                  } else {
+                                    document.getElementById("response-type").textContent = "Other (Relevant) ✳️";
+                                  }
+
+                                  if (submitData.retry) {
+                                    speak(submitData.reply, () => setTimeout(() => askQuestion(), 1000));
+                                  } else {
+                                    current++;
+                                    speak(submitData.reply, () => askQuestion());
+                                  }
+                                });
+                              }, 500);
+                            });
+                          } else {
+                            speak(data.reply, () => {
+                              setTimeout(() => askQuestion(), 1000);
+                            });
+                          }
+                        } else {
+                          current++;
+                          speak(data.reply, () => askQuestion());
+                        }
+                      });
+                    }
+                  });
+                }, 500); // wait briefly before re-listening
+              });
+              return;
+            }
+
+            const isLast = current === questions.length - 1;
+            const followUp = isLast ? " That was the final question." : "";
+
+            speak(replyText + followUp, async () => {
+              current++;
+              if (current >= questions.length) {
+                await fetch("/finalize", { method: "POST" });
+              } else {
+                setTimeout(() => askQuestion(), 500);
+              }
+            });
+          })
+        });
+      };
+
+      speechSynthesis.cancel();
+      speechSynthesis.speak(speakQ);
+      }}
+    async function handleOptionClick(selectedOption) {
+      document.getElementById("ua").textContent = selectedOption;
+
+      const res = await fetch("/submit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          question: questions[current],
+          answer: selectedOption
+        }),
+      });
+
+      const data = await res.json();
+      document.getElementById("ga").textContent = data.reply;
+
+      // 🆕 Categorize visually too
+      if (data.reply.toLowerCase().includes("you've selected")) {
+        document.getElementById("response-type").textContent = "Matched Option ✅";
+      } else if (data.reply.toLowerCase().includes("i didn't quite catch")) {
+        document.getElementById("response-type").textContent = "Off-topic ❌ — Try Again";
+      } else {
+        document.getElementById("response-type").textContent = "Other (Relevant) ✳️";
+      }
+
+      if (data.retry) {
+        speak(data.reply); // retry but don’t increment
+      } else {
+        current++;
+        speak(data.reply, () => askQuestion());
+      }
+    }
+
+
+    function speak(text, callback) {
+      speechSynthesis.cancel();
+      const utter = new SpeechSynthesisUtterance(text);
+      if (selectedVoice) utter.voice = selectedVoice;
+      utter.onend = callback;
+      speechSynthesis.speak(utter);
+    }
+
+    function listenWithRetry(retries, callback) {
+      let attempts = 0;
+
+      function tryListen() {
+        let finalTranscript = "";
+        const recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
+
+        recognition.lang = "en-IN";
+        recognition.interimResults = false;
+        recognition.continuous = false;
+        recognition.maxAlternatives = 3; // ✅ Capture better guesses
+
+        let silenceTimer;
+
+        recognition.onstart = () => {
+          console.log("🎤 Listening started...");
+          silenceTimer = setTimeout(() => {
+            recognition.stop();
+          }, 4000); // ✅ Reduced wait time for short responses
+        };
+
+        recognition.onresult = (event) => {
+          console.log("🔍 All Results:", event.results);
+          if (event.results.length > 0) {
+            finalTranscript = event.results[0][0].transcript.trim().toLowerCase();
+            console.log("✅ Heard:", finalTranscript);
+          }
+        };
+
+        recognition.onerror = (event) => {
+          console.error("🎙️ Error:", event.error);
+          speak("Sorry, I didn't catch that. Please try again.", tryListen);
+        };
+
+        recognition.onend = () => {
+          clearTimeout(silenceTimer);
+          finalTranscript = finalTranscript.trim();
+
+          if (finalTranscript.length === 0) {
+            attempts++;
+            if (attempts < retries) {
+              speak("I couldn't hear you clearly. Please try again.", tryListen);
+            } else {
+              callback(null);
+            }
+          } else {
+            // 👂 Normalize common short phrases
+            const yesWords = ["yes", "yas", "yeah", "ya", "yep", "yup", "yes sir", "okay", "ok", "sure"];
+            const noWords = ["no", "nope", "nah", "not really", "no sir"];
+            const stickWords = ["stick", "stick.", "walking stick", "support stick", "wood stick"];
+
+            if (yesWords.includes(finalTranscript)) finalTranscript = "yes";
+            if (noWords.includes(finalTranscript)) finalTranscript = "no";
+            if (stickWords.includes(finalTranscript)) finalTranscript = "stick";
+
+            callback(finalTranscript);
+          }
+        };
+
+        // ✅ Cue before listening
+        speak("Please answer now.", () => {
+          setTimeout(() => recognition.start(), 300);
+        });
+      }
+
+      tryListen(); // ✅ Correct location — call the function once to start
+    }
+
+  </script>
+</body>
+</html>
